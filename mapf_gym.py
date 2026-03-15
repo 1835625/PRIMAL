@@ -183,6 +183,18 @@ class MAPFEnv(gym.Env):
         self.mutex             = Lock()
         self.DIAGONAL_MOVEMENT = DIAGONAL_MOVEMENT
 
+        # variables for corridor cache
+        self.static_obs_full = None
+
+        self.corridor_id_map = None
+        self.delta_x_full = None
+        self.delta_y_full = None
+
+        self.corridor_cells = {}
+        self.corridor_endpoints = {}
+        self.corridor_stopping_points = {}
+        self.endpoint_to_corridor = {}
+
         # Initialize data structures
         self._setWorld(world0,goals0,blank_world=blank_world)
         if DIAGONAL_MOVEMENT:
@@ -289,10 +301,14 @@ class MAPFEnv(gym.Env):
                 self.initial_world = world0.copy()
                 self.initial_goals = goals0.copy()
                 self.world = State(self.initial_world,self.initial_goals,self.DIAGONAL_MOVEMENT,self.num_agents)
+                self.static_obs_full = (self.world.state == -1).astype(np.float32)
+                self._compute_corridor_cache()
                 return
             self.initial_world = world0
             self.initial_goals = goals0
             self.world = State(world0,goals0,self.DIAGONAL_MOVEMENT,self.num_agents)
+            self.static_obs_full = (self.world.state == -1).astype(np.float32)
+            self._compute_corridor_cache()
             return
 
         #otherwise we have to randomize the world
@@ -325,6 +341,237 @@ class MAPFEnv(gym.Env):
         self.initial_world = world
         self.initial_goals = goals
         self.world = State(world,goals,self.DIAGONAL_MOVEMENT,num_agents=self.num_agents)
+        self.static_obs_full = (self.world.state == -1).astype(np.float32)
+        self._compute_corridor_cache()
+
+    # methods used for generating corridor-related maps
+    def _compute_corridor_cache(self):
+        """
+        Recompute all corridor-related caches for the current static map.
+
+        Updates:
+            self.corridor_id_map
+            self.delta_x_full
+            self.delta_y_full
+            self.corridor_cells
+            self.corridor_endpoints
+            self.corridor_stopping_points
+            self.endpoint_to_corridor
+        """
+        # 1) Clear old cache
+        self.corridor_cells = {}
+        self.corridor_endpoints = {}
+        self.corridor_stopping_points = {}
+        self.endpoint_to_corridor = {}
+
+        h, w = self.world.state.shape
+        self.corridor_id_map = np.full((h, w), -1, dtype=np.int32)
+        self.delta_x_full = np.zeros((h, w), dtype=np.float32)
+        self.delta_y_full = np.zeros((h, w), dtype=np.float32)
+
+        # 2) Find all corridor connected components
+        components = self._find_corridor_components()
+
+        # 3) First pass: assign corridor ids to ALL corridor cells
+        for corridor_id, cells in enumerate(components):
+            self.corridor_cells[corridor_id] = list(cells)
+            for x, y in cells:
+                self.corridor_id_map[x, y] = corridor_id
+
+        # 4) Second pass: compute endpoints / stopping points using the COMPLETE corridor_id_map
+        for corridor_id, cells in self.corridor_cells.items():
+            endpoints = self._find_corridor_endpoints(cells)
+            self.corridor_endpoints[corridor_id] = endpoints
+
+            for ep in endpoints:
+                self.endpoint_to_corridor[ep] = corridor_id
+
+            # stopping points:
+            #   - include the endpoint itself
+            #   - include neighboring free cells that are NOT part of any corridor
+            stopping_points = set(endpoints)
+            for ex, ey in endpoints:
+                for nx, ny in self._get_free_neighbors(ex, ey):
+                    if self.corridor_id_map[nx, ny] == -1:
+                        stopping_points.add((nx, ny))
+
+            self.corridor_stopping_points[corridor_id] = list(stopping_points)
+
+        # 5) Build sparse delta maps from endpoints
+        self._build_delta_maps()
+
+    def _is_free_cell(self, x, y):
+        if x < 0 or x >= self.world.state.shape[0] or y < 0 or y >= self.world.state.shape[1]:
+            return False
+        return self.world.state[x, y] != -1
+
+    def _get_free_neighbors(self, x, y):
+        neighbors = []
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nx = x + dx
+            ny = y + dy
+            if self._is_free_cell(nx, ny):
+                neighbors.append((nx, ny))
+        return neighbors
+
+    def _is_corridor_cell(self, x, y):
+        if not self._is_free_cell(x, y):
+            return False
+        return len(self._get_free_neighbors(x, y)) <= 2
+
+    def _find_corridor_components(self):
+        visited = np.zeros(self.world.state.shape, dtype=np.bool_)
+        components = []
+
+        for x in range(self.world.state.shape[0]):
+            for y in range(self.world.state.shape[1]):
+                if visited[x, y] or not self._is_corridor_cell(x, y):
+                    continue
+
+                stack = [(x, y)]
+                component = []
+                visited[x, y] = True
+                while len(stack) > 0:
+                    cx, cy = stack.pop()
+                    component.append((cx, cy))
+                    for nx, ny in self._get_free_neighbors(cx, cy):
+                        if visited[nx, ny] or not self._is_corridor_cell(nx, ny):
+                            continue
+                        visited[nx, ny] = True
+                        stack.append((nx, ny))
+                components.append(component)
+        return components
+
+    def _find_corridor_endpoints(self, cells):
+        cell_set = set(cells)
+        endpoints = []
+        for x, y in cells:
+            for nx, ny in self._get_free_neighbors(x, y):
+                if (nx, ny) not in cell_set:
+                    endpoints.append((x, y))
+                    break
+        return endpoints
+
+    def _build_delta_maps(self):
+        self.delta_x_full.fill(0.0)
+        self.delta_y_full.fill(0.0)
+
+        for corridor_id, endpoints in self.corridor_endpoints.items():
+            if len(endpoints) != 2:
+                continue
+            (x1, y1), (x2, y2) = endpoints
+            self.delta_x_full[x1, y1] = x2 - x1
+            self.delta_y_full[x1, y1] = y2 - y1
+            self.delta_x_full[x2, y2] = x1 - x2
+            self.delta_y_full[x2, y2] = y1 - y2
+
+    def _extract_fov(self, full_map, top_left, fill_value=0.0):
+        obs_shape = (self.observation_size, self.observation_size)
+        fov = np.full(obs_shape, fill_value, dtype=np.float32)
+
+        src_x0 = max(0, top_left[0])
+        src_y0 = max(0, top_left[1])
+        src_x1 = min(full_map.shape[0], top_left[0] + self.observation_size)
+        src_y1 = min(full_map.shape[1], top_left[1] + self.observation_size)
+
+        if src_x0 >= src_x1 or src_y0 >= src_y1:
+            return fov
+
+        dst_x0 = src_x0 - top_left[0]
+        dst_y0 = src_y0 - top_left[1]
+        dst_x1 = dst_x0 + (src_x1 - src_x0)
+        dst_y1 = dst_y0 + (src_y1 - src_y0)
+        fov[dst_x0:dst_x1, dst_y0:dst_y1] = full_map[src_x0:src_x1, src_y0:src_y1]
+        return fov
+
+    def _get_visible_agents(self, agent_id, top_left):
+        visible_agents = []
+        bottom_right = (top_left[0] + self.observation_size, top_left[1] + self.observation_size)
+        for other_agent in range(1, self.num_agents + 1):
+            if other_agent == agent_id:
+                continue
+            x, y = self.world.getPos(other_agent)
+            if x < top_left[0] or x >= bottom_right[0] or y < top_left[1] or y >= bottom_right[1]:
+                continue
+            visible_agents.append(other_agent)
+        return visible_agents
+
+    def _predict_agent_future_positions(self, other_agent_id, horizon=3):
+        pos = self.world.getPos(other_agent_id)
+        goal = self.world.getGoal(other_agent_id)
+        costs = self.getAstarCosts(pos, goal)
+
+        future_positions = []
+        current = pos
+        for _ in range(horizon):
+            best_pos = current
+            best_cost = costs[current[0], current[1]]
+            for nx, ny in self._get_free_neighbors(current[0], current[1]):
+                neighbor_cost = costs[nx, ny]
+                if neighbor_cost < best_cost:
+                    best_cost = neighbor_cost
+                    best_pos = (nx, ny)
+            current = best_pos
+            future_positions.append(current)
+        return future_positions
+
+    def _build_prediction_maps(self, agent_id, visible_agents, top_left, horizon=3):
+        pred_maps = [np.zeros((self.observation_size, self.observation_size), dtype=np.float32)
+                     for _ in range(horizon)]
+
+        for other_agent_id in visible_agents:
+            if other_agent_id == agent_id:
+                continue
+            future_positions = self._predict_agent_future_positions(other_agent_id, horizon=horizon)
+            for step_idx, pos in enumerate(future_positions):
+                local_x = pos[0] - top_left[0]
+                local_y = pos[1] - top_left[1]
+                if local_x < 0 or local_x >= self.observation_size or local_y < 0 or local_y >= self.observation_size:
+                    continue
+                pred_maps[step_idx][local_x, local_y] = 1.0
+        return tuple(pred_maps)
+
+    def _build_blocking_map(self, agent_id, top_left, visible_agents):
+        """
+        Build a simplified blocking map for the current agent.
+
+        First version rule:
+            If ANY other agent currently occupies a cell in a corridor,
+            then all endpoints of that corridor are marked as 1 in the blocking map
+            (if those endpoints fall inside the current FOV).
+
+        Note:
+            visible_agents is kept in the signature for compatibility, but this
+            implementation intentionally uses ALL other agents globally, not only
+            visible ones.
+        """
+        obs_size = self.observation_size
+        blocking_map = np.zeros((obs_size, obs_size), dtype=np.float32)
+
+        if self.corridor_id_map is None:
+            return blocking_map
+
+        # 1) Find which corridors are currently occupied by OTHER agents
+        occupied_corridors = set()
+        for other_agent_id in range(1, self.num_agents + 1):
+            if other_agent_id == agent_id:
+                continue
+            x, y = self.world.getPos(other_agent_id)
+            corridor_id = self.corridor_id_map[x, y]
+            if corridor_id != -1:
+                occupied_corridors.add(corridor_id)
+
+        # 2) Mark endpoints of occupied corridors if they fall inside this agent's FOV
+        top_x, top_y = top_left
+        for corridor_id in occupied_corridors:
+            endpoints = self.corridor_endpoints.get(corridor_id, [])
+            for ex, ey in endpoints:
+                local_x = ex - top_x
+                local_y = ey - top_y
+                if 0 <= local_x < obs_size and 0 <= local_y < obs_size:
+                    blocking_map[local_x, local_y] = 1.0
+
+        return blocking_map
 
     # Returns an observation of an agent
     def _observe(self,agent_id):
@@ -332,11 +579,10 @@ class MAPFEnv(gym.Env):
         top_left=(self.world.getPos(agent_id)[0]-self.observation_size//2,self.world.getPos(agent_id)[1]-self.observation_size//2)
         bottom_right=(top_left[0]+self.observation_size,top_left[1]+self.observation_size)        
         obs_shape=(self.observation_size,self.observation_size)
-        goal_map             = np.zeros(obs_shape)
-        poss_map             = np.zeros(obs_shape)
-        goals_map            = np.zeros(obs_shape)
-        obs_map              = np.zeros(obs_shape)
-        visible_agents=[]
+        goal_map             = np.zeros(obs_shape, dtype=np.float32)
+        poss_map             = np.zeros(obs_shape, dtype=np.float32)
+        goals_map            = np.zeros(obs_shape, dtype=np.float32)
+        obs_map              = np.zeros(obs_shape, dtype=np.float32)
         for i in range(top_left[0],top_left[0]+self.observation_size):
             for j in range(top_left[1],top_left[1]+self.observation_size):
                 if i>=self.world.state.shape[0] or i<0 or j>=self.world.state.shape[1] or j<0:
@@ -354,8 +600,9 @@ class MAPFEnv(gym.Env):
                     goal_map[i-top_left[0],j-top_left[1]]=1
                 if self.world.state[i,j]>0 and self.world.state[i,j]!=agent_id:
                     #other agents' positions
-                    visible_agents.append(self.world.state[i,j])
                     poss_map[i-top_left[0],j-top_left[1]]=1
+
+        visible_agents = self._get_visible_agents(agent_id, top_left)
 
         for agent in visible_agents:
             x, y = self.world.getGoal(agent)
@@ -363,13 +610,20 @@ class MAPFEnv(gym.Env):
                         max(top_left[1], min(top_left[1] + self.observation_size - 1, y)))
             goals_map[min_node[0] - top_left[0], min_node[1] - top_left[1]] = 1
 
+        blocking_map = self._build_blocking_map(agent_id, top_left, visible_agents)
+        delta_x_map = self._extract_fov(self.delta_x_full, top_left, fill_value=0.0)
+        delta_y_map = self._extract_fov(self.delta_y_full, top_left, fill_value=0.0)
+        pred_1, pred_2, pred_3 = self._build_prediction_maps(agent_id, visible_agents, top_left, horizon=3)
+
         dx=self.world.getGoal(agent_id)[0]-self.world.getPos(agent_id)[0]
         dy=self.world.getGoal(agent_id)[1]-self.world.getPos(agent_id)[1]
         mag=(dx**2+dy**2)**.5
         if mag!=0:
             dx=dx/mag
             dy=dy/mag
-        return ([poss_map,goal_map,goals_map,obs_map],[dx,dy,mag])
+        return ([poss_map,goal_map,goals_map,obs_map,
+                 blocking_map,delta_x_map,delta_y_map,
+                 pred_1,pred_2,pred_3],[dx,dy,mag])
 
 
 
