@@ -8,7 +8,16 @@ from matplotlib.colors import hsv_to_rgb
 import random
 import math
 import copy
-from od_mstar3 import cpp_mstar
+# from od_mstar3 import cpp_mstar
+# from od_mstar3.col_set_addition import NoSolutionError, OutOfTimeError
+try:
+    from od_mstar3 import cpp_mstar
+    USE_CPP_MSTAR = True
+except ImportError:
+    cpp_mstar = None
+    USE_CPP_MSTAR = False
+
+from od_mstar3 import od_mstar
 from od_mstar3.col_set_addition import NoSolutionError, OutOfTimeError
 # from gym.envs.classic_control import rendering        
 
@@ -414,42 +423,91 @@ class MAPFEnv(gym.Env):
                 neighbors.append((nx, ny))
         return neighbors
 
+    def _is_blocked_or_oob(self, x, y):
+        h, w = self.world.state.shape
+        if x < 0 or x >= h or y < 0 or y >= w:
+            return True
+        return self.world.state[x, y] == -1
+    
     def _is_corridor_cell(self, x, y):
+        """
+        A cell is considered corridor-like if:
+        1) it is free
+        2) it has exactly two free neighbors
+        3) those two free neighbors are opposite (left-right or up-down)
+        4) the two side directions are blocked (or out of bounds)
+
+        This avoids classifying room corners / room boundary cells as corridors.
+        """
         if not self._is_free_cell(x, y):
             return False
-        return len(self._get_free_neighbors(x, y)) <= 2
+
+        neighbors = self._get_free_neighbors(x, y)
+
+        # First version: only keep "internal corridor" cells with exactly two free neighbors
+        if len(neighbors) != 2:
+            return False
+
+        n1, n2 = neighbors
+
+        # Horizontal corridor: left and right are free
+        horizontal = (n1[0] == x and n2[0] == x and abs(n1[1] - n2[1]) == 2)
+        if horizontal:
+            return self._is_blocked_or_oob(x - 1, y) and self._is_blocked_or_oob(x + 1, y)
+
+        # Vertical corridor: up and down are free
+        vertical = (n1[1] == y and n2[1] == y and abs(n1[0] - n2[0]) == 2)
+        if vertical:
+            return self._is_blocked_or_oob(x, y - 1) and self._is_blocked_or_oob(x, y + 1)
+
+        return False
 
     def _find_corridor_components(self):
-        visited = np.zeros(self.world.state.shape, dtype=np.bool_)
+        h, w = self.world.state.shape
+        visited = set()
         components = []
 
-        for x in range(self.world.state.shape[0]):
-            for y in range(self.world.state.shape[1]):
-                if visited[x, y] or not self._is_corridor_cell(x, y):
+        for x in range(h):
+            for y in range(w):
+                if (x, y) in visited:
+                    continue
+                if not self._is_corridor_cell(x, y):
                     continue
 
                 stack = [(x, y)]
                 component = []
-                visited[x, y] = True
-                while len(stack) > 0:
+                visited.add((x, y))
+
+                while stack:
                     cx, cy = stack.pop()
                     component.append((cx, cy))
+
                     for nx, ny in self._get_free_neighbors(cx, cy):
-                        if visited[nx, ny] or not self._is_corridor_cell(nx, ny):
+                        if (nx, ny) in visited:
                             continue
-                        visited[nx, ny] = True
-                        stack.append((nx, ny))
-                components.append(component)
+                        if self._is_corridor_cell(nx, ny):
+                            visited.add((nx, ny))
+                            stack.append((nx, ny))
+
+                # filter tiny false-positive corridor components
+                if len(component) >= 2:
+                    components.append(component)
+
         return components
 
     def _find_corridor_endpoints(self, cells):
         cell_set = set(cells)
         endpoints = []
+
         for x, y in cells:
+            corridor_neighbors = 0
             for nx, ny in self._get_free_neighbors(x, y):
-                if (nx, ny) not in cell_set:
-                    endpoints.append((x, y))
-                    break
+                if (nx, ny) in cell_set:
+                    corridor_neighbors += 1
+
+            if corridor_neighbors <= 1:
+                endpoints.append((x, y))
+
         return endpoints
 
     def _build_delta_maps(self):
@@ -739,16 +797,30 @@ class MAPFEnv(gym.Env):
             costs[i,j]=gScore[i,j]
         return costs
     
-    def astar(self,world,start,goal,robots=[]):
-        '''robots is a list of robots to add to the world'''
-        for (i,j) in robots:
-            world[i,j]=1
+    # def astar(self,world,start,goal,robots=[]):
+    #     '''robots is a list of robots to add to the world'''
+    #     for (i,j) in robots:
+    #         world[i,j]=1
+    #     try:
+    #         path=cpp_mstar.find_path(world,[start],[goal],1,5)
+    #     except NoSolutionError:
+    #         path=None
+    #     for (i,j) in robots:
+    #         world[i,j]=0
+    #     return path
+
+    def astar(self, world, start, goal, robots=[]):
+        for (i, j) in robots:
+            world[i, j] = 1
         try:
-            path=cpp_mstar.find_path(world,[start],[goal],1,5)
-        except NoSolutionError:
-            path=None
-        for (i,j) in robots:
-            world[i,j]=0
+            if USE_CPP_MSTAR:
+                path = cpp_mstar.find_path(world, [start], [goal], 1, 5)
+            else:
+                path = od_mstar.find_path(world, [start], [goal], 1, 5)
+        except (NoSolutionError, OutOfTimeError):
+            path = None
+        for (i, j) in robots:
+            world[i, j] = 0
         return path
     
     def get_blocking_reward(self,agent_id):
