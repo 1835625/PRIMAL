@@ -89,3 +89,11 @@ auto/
 ###################
 __pycache__/
 results/
+
+# Local tests
+###################
+.ipynb_checkpoints/
+.vscode/
+model_primal_cpu_smoke/
+train_primal_cpu_smoke/
+gifs_primal_cpu_smoke/
