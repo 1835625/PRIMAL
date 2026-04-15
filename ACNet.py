@@ -7,6 +7,8 @@ KEEP_PROB1             = 1 # was 0.5
 KEEP_PROB2             = 1 # was 0.7
 RNN_SIZE               = 512
 GOAL_REPR_SIZE         = 12
+OBS_CHANNELS           = 10
+GOAL_VECTOR_SIZE       = 3
 
 #Used to initialize weights for policy and value output layers (Do we need to use that? Maybe not now)
 def normalized_columns_initializer(std=1.0):
@@ -17,13 +19,22 @@ def normalized_columns_initializer(std=1.0):
     return _initializer
 
 class ACNet:
-    def __init__(self, scope, a_size, trainer,TRAINING,GRID_SIZE,GLOBAL_NET_SCOPE):
+    def __init__(self, scope, a_size, trainer,TRAINING,GRID_SIZE,GLOBAL_NET_SCOPE, obs_channels=OBS_CHANNELS):
         with tf.variable_scope(str(scope)+'/qvalues'):
-            #The input size may require more work to fit the interface.
-            self.inputs = tf.placeholder(shape=[None,4,GRID_SIZE,GRID_SIZE], dtype=tf.float32)
-            self.goal_pos=tf.placeholder(shape=[None,3],dtype=tf.float32)
+            self.inputs = tf.placeholder(
+                shape=[None, obs_channels, GRID_SIZE, GRID_SIZE],
+                dtype=tf.float32
+            )
+            self.goal_pos = tf.placeholder(
+                shape=[None, GOAL_VECTOR_SIZE],
+                dtype=tf.float32
+            )
             self.myinput = tf.transpose(self.inputs, perm=[0,2,3,1])
-            self.policy, self.value, self.state_out, self.state_in, self.state_init, self.blocking, self.on_goal,self.valids = self._build_net(self.myinput,self.goal_pos,RNN_SIZE,TRAINING,a_size)
+            self.policy, self.value, self.state_out, self.state_in, self.state_init, \
+                self.blocking, self.valids = self._build_net(
+                    self.myinput, self.goal_pos, RNN_SIZE, TRAINING, a_size
+                )
+
         if TRAINING:
             self.actions                = tf.placeholder(shape=[None], dtype=tf.int32)
             self.actions_onehot         = tf.one_hot(self.actions, a_size, dtype=tf.float32)
@@ -31,46 +42,52 @@ class ACNet:
             self.target_v               = tf.placeholder(tf.float32, [None], 'Vtarget')
             self.advantages             = tf.placeholder(shape=[None], dtype=tf.float32)
             self.target_blockings       = tf.placeholder(tf.float32, [None])
-            self.target_on_goals        = tf.placeholder(tf.float32, [None])
             self.responsible_outputs    = tf.reduce_sum(self.policy * self.actions_onehot, [1])
             self.train_value            = tf.placeholder(tf.float32, [None])
             self.optimal_actions        = tf.placeholder(tf.int32,[None])
             self.optimal_actions_onehot = tf.one_hot(self.optimal_actions, a_size, dtype=tf.float32)
 
-            
-            # Loss Functions
-            self.value_loss    = tf.reduce_sum(self.train_value*tf.square(self.target_v - tf.reshape(self.value, shape=[-1])))
-            self.entropy       = - tf.reduce_sum(self.policy * tf.log(tf.clip_by_value(self.policy,1e-10,1.0)))
-            self.policy_loss   = - tf.reduce_sum(tf.log(tf.clip_by_value(self.responsible_outputs,1e-15,1.0)) * self.advantages)
-            self.valid_loss    = - tf.reduce_sum(tf.log(tf.clip_by_value(self.valids,1e-10,1.0)) *\
-                                self.train_valid+tf.log(tf.clip_by_value(1-self.valids,1e-10,1.0)) * (1-self.train_valid))
-            self.blocking_loss = - tf.reduce_sum(self.target_blockings*tf.log(tf.clip_by_value(self.blocking,1e-10,1.0))\
-                                      +(1-self.target_blockings)*tf.log(tf.clip_by_value(1-self.blocking,1e-10,1.0)))
-            self.on_goal_loss = - tf.reduce_sum(self.target_on_goals*tf.log(tf.clip_by_value(self.on_goal,1e-10,1.0))\
-                                      +(1-self.target_on_goals)*tf.log(tf.clip_by_value(1-self.on_goal,1e-10,1.0)))
-            self.loss          = 0.5 * self.value_loss + self.policy_loss + 0.5*self.valid_loss \
-                            - self.entropy * 0.01 +.5*self.blocking_loss
-            self.imitation_loss = tf.reduce_mean(tf.contrib.keras.backend.categorical_crossentropy(self.optimal_actions_onehot,self.policy)) 
-            
-            # Get gradients from local network using local losses and
-            # normalize the gradients using clipping
-            local_vars         = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope+'/qvalues')
-            self.gradients     = tf.gradients(self.loss, local_vars)
-            self.var_norms     = tf.global_norm(local_vars)
+            self.value_loss    = tf.reduce_sum(
+                self.train_value * tf.square(self.target_v - tf.reshape(self.value, shape=[-1]))
+            )
+            self.entropy       = - tf.reduce_sum(
+                self.policy * tf.log(tf.clip_by_value(self.policy,1e-10,1.0))
+            )
+            self.policy_loss   = - tf.reduce_sum(
+                tf.log(tf.clip_by_value(self.responsible_outputs,1e-15,1.0)) * self.advantages
+            )
+            self.valid_loss    = - tf.reduce_sum(
+                tf.log(tf.clip_by_value(self.valids,1e-10,1.0)) * self.train_valid +
+                tf.log(tf.clip_by_value(1-self.valids,1e-10,1.0)) * (1-self.train_valid)
+            )
+            self.blocking_loss = - tf.reduce_sum(
+                self.target_blockings * tf.log(tf.clip_by_value(self.blocking,1e-10,1.0)) +
+                (1-self.target_blockings) * tf.log(tf.clip_by_value(1-self.blocking,1e-10,1.0))
+            )
+
+            self.loss = 0.5 * self.value_loss + self.policy_loss + 0.5 * self.valid_loss \
+                        - self.entropy * 0.01 + 0.5 * self.blocking_loss
+
+            self.imitation_loss = tf.reduce_mean(
+                tf.contrib.keras.backend.categorical_crossentropy(
+                    self.optimal_actions_onehot, self.policy
+                )
+            )
+
+            local_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope+'/qvalues')
+            self.gradients = tf.gradients(self.loss, local_vars)
+            self.var_norms = tf.global_norm(local_vars)
             grads, self.grad_norms = tf.clip_by_global_norm(self.gradients, GRAD_CLIP)
 
-            # Apply local gradients to global network
-            global_vars        = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, GLOBAL_NET_SCOPE+'/qvalues')
-            self.apply_grads   = trainer.apply_gradients(zip(grads, global_vars))
+            global_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, GLOBAL_NET_SCOPE+'/qvalues')
+            self.apply_grads = trainer.apply_gradients(zip(grads, global_vars))
 
-            #now the gradients for imitation loss
-            self.i_gradients     = tf.gradients(self.imitation_loss, local_vars)
-            self.i_var_norms     = tf.global_norm(local_vars)
+            self.i_gradients = tf.gradients(self.imitation_loss, local_vars)
+            self.i_var_norms = tf.global_norm(local_vars)
             i_grads, self.i_grad_norms = tf.clip_by_global_norm(self.i_gradients, GRAD_CLIP)
+            self.apply_imitation_grads = trainer.apply_gradients(zip(i_grads, global_vars))
 
-            # Apply local gradients to global network
-            self.apply_imitation_grads   = trainer.apply_gradients(zip(i_grads, global_vars))
-        print("Hello World... From  "+str(scope))     # :)
+        print("Hello World... From  "+str(scope))   # :)
 
     def _build_net(self,inputs,goal_pos,RNN_SIZE,TRAINING,a_size):
         w_init   = layers.variance_scaling_initializer()
@@ -111,11 +128,28 @@ class ACNet:
         state_out = (lstm_c[:1, :], lstm_h[:1, :])
         self.rnn_out = tf.reshape(lstm_outputs, [-1, RNN_SIZE])
 
-        policy_layer = layers.fully_connected(inputs=self.rnn_out, num_outputs=a_size,weights_initializer=normalized_columns_initializer(1./float(a_size)), biases_initializer=None, activation_fn=None)
-        policy       = tf.nn.softmax(policy_layer)
-        policy_sig   = tf.sigmoid(policy_layer)
-        value        = layers.fully_connected(inputs=self.rnn_out, num_outputs=1, weights_initializer=normalized_columns_initializer(1.0), biases_initializer=None, activation_fn=None)
-        blocking      = layers.fully_connected(inputs=self.rnn_out, num_outputs=1, weights_initializer=normalized_columns_initializer(1.0), biases_initializer=None, activation_fn=tf.sigmoid)
-        on_goal      = layers.fully_connected(inputs=self.rnn_out, num_outputs=1, weights_initializer=normalized_columns_initializer(1.0), biases_initializer=None, activation_fn=tf.sigmoid)
+        policy_layer = layers.fully_connected(
+            inputs=self.rnn_out,
+            num_outputs=a_size,
+            weights_initializer=normalized_columns_initializer(1./float(a_size)),
+            biases_initializer=None,
+            activation_fn=None
+        )
+        policy     = tf.nn.softmax(policy_layer)
+        policy_sig = tf.sigmoid(policy_layer)
+        value      = layers.fully_connected(
+            inputs=self.rnn_out,
+            num_outputs=1,
+            weights_initializer=normalized_columns_initializer(1.0),
+            biases_initializer=None,
+            activation_fn=None
+        )
+        blocking   = layers.fully_connected(
+            inputs=self.rnn_out,
+            num_outputs=1,
+            weights_initializer=normalized_columns_initializer(1.0),
+            biases_initializer=None,
+            activation_fn=tf.sigmoid
+        )
 
-        return policy, value, state_out ,state_in, state_init, blocking, on_goal,policy_sig
+        return policy, value, state_out, state_in, state_init, blocking, policy_sig
