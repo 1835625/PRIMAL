@@ -196,13 +196,17 @@ class MAPFEnv(gym.Env):
         self.static_obs_full = None
 
         self.corridor_id_map = None
+        self.corridor_type_map = None
         self.delta_x_full = None
         self.delta_y_full = None
 
         self.corridor_cells = {}
         self.corridor_endpoints = {}
         self.corridor_stopping_points = {}
+        self.corridor_ordered_cells = {}
         self.endpoint_to_corridor = {}
+        self.stopping_point_to_corridor = {}
+        self.stopping_point_meta = {}
 
         # Initialize data structures
         self._setWorld(world0,goals0,blank_world=blank_world)
@@ -360,58 +364,111 @@ class MAPFEnv(gym.Env):
 
         Updates:
             self.corridor_id_map
+            self.corridor_type_map
             self.delta_x_full
             self.delta_y_full
             self.corridor_cells
             self.corridor_endpoints
             self.corridor_stopping_points
+            self.corridor_ordered_cells
             self.endpoint_to_corridor
+            self.stopping_point_to_corridor
+            self.stopping_point_meta
         """
         # 1) Clear old cache
         self.corridor_cells = {}
         self.corridor_endpoints = {}
         self.corridor_stopping_points = {}
+        self.corridor_ordered_cells = {}
         self.endpoint_to_corridor = {}
+        self.stopping_point_to_corridor = {}
+        self.stopping_point_meta = {}
 
         h, w = self.world.state.shape
         self.corridor_id_map = np.full((h, w), -1, dtype=np.int32)
+        self.corridor_type_map = np.zeros((h, w), dtype=np.int32)
         self.delta_x_full = np.zeros((h, w), dtype=np.float32)
         self.delta_y_full = np.zeros((h, w), dtype=np.float32)
 
+        # corridor_type_map coding:
+        #   -1: obstacle
+        #    0: free outside corridor
+        #    1: corridor internal cell
+        #    2: corridor endpoint / decision point
+        #    3: stopping point
+        for x in range(h):
+            for y in range(w):
+                if not self._is_static_free_cell(x, y):
+                    self.corridor_type_map[x, y] = -1
+
+        free_degree_map = self._compute_free_degree_map()
+        visited = set()
+        corridor_id = 0
+
         # 2) Find all corridor connected components
-        components = self._find_corridor_components()
+        for x in range(h):
+            for y in range(w):
+                if (x, y) in visited:
+                    continue
+                if not self._is_corridor_seed(x, y, free_degree_map):
+                    continue
 
-        # 3) First pass: assign corridor ids to ALL corridor cells
-        for corridor_id, cells in enumerate(components):
-            self.corridor_cells[corridor_id] = list(cells)
-            for x, y in cells:
-                self.corridor_id_map[x, y] = corridor_id
+                cells = self._grow_corridor_component((x, y), free_degree_map, visited)
+                if not cells:
+                    continue
 
-        # 4) Second pass: compute endpoints / stopping points using the COMPLETE corridor_id_map
-        for corridor_id, cells in self.corridor_cells.items():
-            endpoints = self._find_corridor_endpoints(cells)
-            self.corridor_endpoints[corridor_id] = endpoints
+                endpoints = self._collect_corridor_endpoints(cells, free_degree_map)
+                if len(endpoints) == 0:
+                    # Components with no decision-side endpoint do not provide entry semantics.
+                    continue
 
-            for ep in endpoints:
-                self.endpoint_to_corridor[ep] = corridor_id
+                ordered_cells = self._order_corridor_cells(cells)
+                if not ordered_cells:
+                    ordered_cells = sorted(list(cells))
 
-            # stopping points:
-            #   - include the endpoint itself
-            #   - include neighboring free cells that are NOT part of any corridor
-            stopping_points = set(endpoints)
-            for ex, ey in endpoints:
-                for nx, ny in self._get_free_neighbors(ex, ey):
-                    if self.corridor_id_map[nx, ny] == -1:
-                        stopping_points.add((nx, ny))
+                self.corridor_cells[corridor_id] = ordered_cells
+                self.corridor_ordered_cells[corridor_id] = ordered_cells
 
-            self.corridor_stopping_points[corridor_id] = list(stopping_points)
+                for cx, cy in cells:
+                    self.corridor_id_map[cx, cy] = corridor_id
+                    self.corridor_type_map[cx, cy] = 1
 
-        # 5) Build sparse delta maps from endpoints
+                self.corridor_endpoints[corridor_id] = endpoints
+                for ex, ey in endpoints:
+                    if (ex, ey) not in self.endpoint_to_corridor:
+                        self.endpoint_to_corridor[(ex, ey)] = corridor_id
+                    if self.corridor_type_map[ex, ey] != -1:
+                        self.corridor_type_map[ex, ey] = 2
+
+                stopping_points, stopping_meta = self._build_stopping_points_for_corridor(
+                    corridor_id, ordered_cells, endpoints
+                )
+                self.corridor_stopping_points[corridor_id] = stopping_points
+
+                for sp in stopping_points:
+                    self.stopping_point_to_corridor[sp] = corridor_id
+                    if self.corridor_type_map[sp[0], sp[1]] != -1:
+                        self.corridor_type_map[sp[0], sp[1]] = 3
+
+                for sp, meta in stopping_meta.items():
+                    self.stopping_point_meta[sp] = meta
+
+                corridor_id += 1
+
+        # 3) Build sparse delta maps from stopping points
         self._build_delta_maps()
 
     def _is_free_cell(self, x, y):
         if x < 0 or x >= self.world.state.shape[0] or y < 0 or y >= self.world.state.shape[1]:
             return False
+        return self.world.state[x, y] != -1
+
+    def _is_static_free_cell(self, x, y):
+        h, w = self.world.state.shape
+        if x < 0 or x >= h or y < 0 or y >= w:
+            return False
+        if self.static_obs_full is not None:
+            return self.static_obs_full[x, y] == 0
         return self.world.state[x, y] != -1
 
     def _get_free_neighbors(self, x, y):
@@ -423,105 +480,328 @@ class MAPFEnv(gym.Env):
                 neighbors.append((nx, ny))
         return neighbors
 
-    def _is_blocked_or_oob(self, x, y):
+    def _get_static_free_neighbors(self, x, y):
+        neighbors = []
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nx = x + dx
+            ny = y + dy
+            if self._is_static_free_cell(nx, ny):
+                neighbors.append((nx, ny))
+        return neighbors
+
+    def _is_static_blocked_or_oob(self, x, y):
         h, w = self.world.state.shape
         if x < 0 or x >= h or y < 0 or y >= w:
             return True
-        return self.world.state[x, y] == -1
+        return not self._is_static_free_cell(x, y)
     
-    def _is_corridor_cell(self, x, y):
+    def _is_pass_through_corridor_cell(self, x, y, free_degree_map):
         """
-        A cell is considered corridor-like if:
-        1) it is free
-        2) it has exactly two free neighbors
-        3) those two free neighbors are opposite (left-right or up-down)
-        4) the two side directions are blocked (or out of bounds)
-
-        This avoids classifying room corners / room boundary cells as corridors.
+        严格 corridor 判定：
+        - 恰好两个自由邻居
+        - 两邻居必须对向
+        - 另外两个侧向必须被堵
         """
-        if not self._is_free_cell(x, y):
+        if not self._is_static_free_cell(x, y):
             return False
 
-        neighbors = self._get_free_neighbors(x, y)
-
-        # First version: only keep "internal corridor" cells with exactly two free neighbors
+        neighbors = self._get_static_free_neighbors(x, y)
         if len(neighbors) != 2:
             return False
 
         n1, n2 = neighbors
 
-        # Horizontal corridor: left and right are free
+        # 水平 corridor：左右自由，上下被堵
         horizontal = (n1[0] == x and n2[0] == x and abs(n1[1] - n2[1]) == 2)
         if horizontal:
-            return self._is_blocked_or_oob(x - 1, y) and self._is_blocked_or_oob(x + 1, y)
+            return self._is_static_blocked_or_oob(x - 1, y) and self._is_static_blocked_or_oob(x + 1, y)
 
-        # Vertical corridor: up and down are free
+        # 垂直 corridor：上下自由，左右被堵
         vertical = (n1[1] == y and n2[1] == y and abs(n1[0] - n2[0]) == 2)
         if vertical:
-            return self._is_blocked_or_oob(x, y - 1) and self._is_blocked_or_oob(x, y + 1)
+            return self._is_static_blocked_or_oob(x, y - 1) and self._is_static_blocked_or_oob(x, y + 1)
+
+        return False
+    
+    def _is_dead_end_terminal_cell(self, x, y, free_degree_map):
+        """
+        用来补 dead-end 最末端格子（degree == 1）。
+
+        条件：
+        1) 当前格恰好只有一个静态自由邻居
+        2) 当前格在唯一邻居方向上形成狭窄通道（侧向被堵）
+        3) 唯一邻居要么是严格的普通 corridor cell，要么是 decision/endpoint 候选
+        """
+        if not self._is_static_free_cell(x, y):
+            return False
+
+        if free_degree_map[x, y] != 1:
+            return False
+
+        neighbors = self._get_static_free_neighbors(x, y)
+        if len(neighbors) != 1:
+            return False
+
+        nx, ny = neighbors[0]
+
+        # 当前 terminal cell 必须也具有 corridor 的“狭窄性”
+        if nx == x:
+            # 水平方向连接，要求上下被堵
+            if not (self._is_static_blocked_or_oob(x - 1, y) and self._is_static_blocked_or_oob(x + 1, y)):
+                return False
+        elif ny == y:
+            # 垂直方向连接，要求左右被堵
+            if not (self._is_static_blocked_or_oob(x, y - 1) and self._is_static_blocked_or_oob(x, y + 1)):
+                return False
+        else:
+            return False
+
+        neighbor_degree = free_degree_map[nx, ny]
+
+        # 情况 A：唯一邻居本身是普通 corridor cell
+        if self._is_pass_through_corridor_cell(nx, ny, free_degree_map):
+            return True
+
+        # 情况 B：唯一邻居是外部 decision / endpoint 候选（自由度较大）
+        # 这允许“只有一个 internal cell 的短死胡同”
+        if neighbor_degree >= 3:
+            return True
 
         return False
 
-    def _find_corridor_components(self):
+    def _compute_free_degree_map(self):
         h, w = self.world.state.shape
-        visited = set()
-        components = []
-
+        degree_map = np.zeros((h, w), dtype=np.int32)
         for x in range(h):
             for y in range(w):
-                if (x, y) in visited:
+                if not self._is_static_free_cell(x, y):
                     continue
-                if not self._is_corridor_cell(x, y):
+                degree_map[x, y] = len(self._get_static_free_neighbors(x, y))
+        return degree_map
+
+    def _is_corridor_internal_candidate(self, x, y, free_degree_map):
+        """
+        混合判定：
+        - degree==2 时，沿用严格 corridor 判定
+        - degree==1 时，只允许 dead-end terminal cell
+        """
+        if not self._is_static_free_cell(x, y):
+            return False
+
+        degree = free_degree_map[x, y]
+
+        # 普通 corridor
+        if degree == 2:
+            return self._is_pass_through_corridor_cell(x, y, free_degree_map)
+
+        # 补 dead-end 末端格
+        if degree == 1:
+            return self._is_dead_end_terminal_cell(x, y, free_degree_map)
+
+        return False
+
+    def _is_corridor_seed(self, x, y, free_degree_map):
+        """
+        直接沿用严格 corridor internal 判定。
+        只要当前格是合法 corridor internal cell，就可作为 seed。
+        """
+        return self._is_corridor_internal_candidate(x, y, free_degree_map)
+
+    def _grow_corridor_component(self, seed, free_degree_map, visited):
+        stack = [seed]
+        cells = set()
+
+        while stack:
+            cx, cy = stack.pop()
+            if (cx, cy) in cells:
+                continue
+            if not self._is_corridor_internal_candidate(cx, cy, free_degree_map):
+                continue
+
+            cells.add((cx, cy))
+            visited.add((cx, cy))
+
+            for nx, ny in self._get_static_free_neighbors(cx, cy):
+                if (nx, ny) in cells:
                     continue
+                if self._is_corridor_internal_candidate(nx, ny, free_degree_map):
+                    stack.append((nx, ny))
 
-                stack = [(x, y)]
-                component = []
-                visited.add((x, y))
+        return cells
 
-                while stack:
-                    cx, cy = stack.pop()
-                    component.append((cx, cy))
+    def _collect_corridor_endpoints(self, cells, free_degree_map):
+        endpoints = set()
+        for cx, cy in cells:
+            for nx, ny in self._get_static_free_neighbors(cx, cy):
+                if (nx, ny) in cells:
+                    continue
+                # Endpoint / decision point candidate should be outside corridor
+                # and have branching capacity.
+                if free_degree_map[nx, ny] >= 3:
+                    endpoints.add((nx, ny))
+        return sorted(list(endpoints))
 
-                    for nx, ny in self._get_free_neighbors(cx, cy):
-                        if (nx, ny) in visited:
-                            continue
-                        if self._is_corridor_cell(nx, ny):
-                            visited.add((nx, ny))
-                            stack.append((nx, ny))
+    def _order_corridor_cells(self, cells):
+        if not cells:
+            return []
 
-                # filter tiny false-positive corridor components
-                if len(component) >= 2:
-                    components.append(component)
-
-        return components
-
-    def _find_corridor_endpoints(self, cells):
         cell_set = set(cells)
-        endpoints = []
-
-        for x, y in cells:
-            corridor_neighbors = 0
-            for nx, ny in self._get_free_neighbors(x, y):
+        adjacency = {}
+        for x, y in cell_set:
+            adjacency[(x, y)] = []
+            for nx, ny in self._get_static_free_neighbors(x, y):
                 if (nx, ny) in cell_set:
-                    corridor_neighbors += 1
+                    adjacency[(x, y)].append((nx, ny))
 
-            if corridor_neighbors <= 1:
-                endpoints.append((x, y))
+        degree_one_nodes = sorted([c for c in cell_set if len(adjacency[c]) <= 1])
+        if degree_one_nodes:
+            start = degree_one_nodes[0]
+        else:
+            start = sorted(list(cell_set))[0]
 
-        return endpoints
+        order = [start]
+        visited_local = set([start])
+        prev = None
+        current = start
+
+        while True:
+            next_candidates = []
+            for neighbor in adjacency[current]:
+                if neighbor == prev:
+                    continue
+                if neighbor in visited_local:
+                    continue
+                next_candidates.append(neighbor)
+
+            if len(next_candidates) == 0:
+                break
+
+            next_cell = sorted(next_candidates)[0]
+            order.append(next_cell)
+            visited_local.add(next_cell)
+            prev = current
+            current = next_cell
+
+        if len(order) != len(cell_set):
+            for cell in sorted(list(cell_set)):
+                if cell not in visited_local:
+                    order.append(cell)
+
+        return order
+
+    def _build_stopping_points_for_corridor(self, corridor_id, ordered_cells, endpoints):
+        cell_to_index = {cell: idx for idx, cell in enumerate(ordered_cells)}
+
+        endpoint_entries = []
+        for endpoint in endpoints:
+            adjacent_internal = []
+            for neighbor in self._get_static_free_neighbors(endpoint[0], endpoint[1]):
+                if neighbor in cell_to_index:
+                    adjacent_internal.append(neighbor)
+            if len(adjacent_internal) == 0:
+                continue
+
+            best_stop = min(adjacent_internal, key=lambda c: cell_to_index[c])
+            endpoint_entries.append({
+                "endpoint": endpoint,
+                "stopping_point": best_stop,
+                "index": cell_to_index[best_stop]
+            })
+
+        if len(endpoint_entries) == 0:
+            return [], {}
+
+        endpoint_entries.sort(key=lambda e: e["index"])
+
+        # Most corridors in this formulation are dead-end (1 endpoint)
+        # or pass-through (2 endpoints). If there are more, keep the outermost two.
+        selected_entries = []
+        if len(endpoint_entries) == 1:
+            selected_entries = [endpoint_entries[0]]
+        else:
+            selected_entries = [endpoint_entries[0], endpoint_entries[-1]]
+
+        stopping_points = []
+        stopping_meta = {}
+
+        if len(selected_entries) == 2 and \
+                selected_entries[0]["endpoint"] != selected_entries[1]["endpoint"] and \
+                selected_entries[0]["stopping_point"] != selected_entries[1]["stopping_point"]:
+            left = selected_entries[0]
+            right = selected_entries[1]
+            i_left = left["index"]
+            i_right = right["index"]
+
+            if i_left <= i_right:
+                path_lr = ordered_cells[i_left:i_right + 1]
+            else:
+                path_lr = list(reversed(ordered_cells[i_right:i_left + 1]))
+                left, right = right, left
+
+            left_stop = left["stopping_point"]
+            right_stop = right["stopping_point"]
+            left_endpoint = left["endpoint"]
+            right_endpoint = right["endpoint"]
+
+            stopping_points.extend([left_stop, right_stop])
+
+            stopping_meta[left_stop] = {
+                "corridor_id": corridor_id,
+                "endpoint": left_endpoint,
+                "paired_endpoint": right_endpoint,
+                "paired_stopping_point": right_stop,
+                "is_dead_end": False,
+                "scan_cells": list(path_lr)
+            }
+            stopping_meta[right_stop] = {
+                "corridor_id": corridor_id,
+                "endpoint": right_endpoint,
+                "paired_endpoint": left_endpoint,
+                "paired_stopping_point": left_stop,
+                "is_dead_end": False,
+                "scan_cells": list(reversed(path_lr))
+            }
+        else:
+            entry = selected_entries[0]
+            stop = entry["stopping_point"]
+            idx = entry["index"]
+
+            left_path = list(reversed(ordered_cells[:idx + 1]))
+            right_path = ordered_cells[idx:]
+            if len(right_path) >= len(left_path):
+                scan_cells = list(right_path)
+            else:
+                scan_cells = list(left_path)
+
+            stopping_points.append(stop)
+            stopping_meta[stop] = {
+                "corridor_id": corridor_id,
+                "endpoint": entry["endpoint"],
+                "paired_endpoint": None,
+                "paired_stopping_point": None,
+                "is_dead_end": True,
+                "scan_cells": scan_cells
+            }
+
+        # remove duplicates while keeping order
+        stopping_points = list(OrderedDict.fromkeys(stopping_points))
+        return stopping_points, stopping_meta
 
     def _build_delta_maps(self):
         self.delta_x_full.fill(0.0)
         self.delta_y_full.fill(0.0)
 
-        for corridor_id, endpoints in self.corridor_endpoints.items():
-            if len(endpoints) != 2:
+        for stopping_point, meta in self.stopping_point_meta.items():
+            endpoint = meta.get("endpoint")
+            paired_endpoint = meta.get("paired_endpoint")
+            if endpoint is None or paired_endpoint is None:
                 continue
-            (x1, y1), (x2, y2) = endpoints
-            self.delta_x_full[x1, y1] = x2 - x1
-            self.delta_y_full[x1, y1] = y2 - y1
-            self.delta_x_full[x2, y2] = x1 - x2
-            self.delta_y_full[x2, y2] = y1 - y2
+
+            sx, sy = stopping_point
+            ex, ey = endpoint
+            ox, oy = paired_endpoint
+            self.delta_x_full[sx, sy] = ox - ex
+            self.delta_y_full[sx, sy] = oy - ey
 
     def _extract_fov(self, full_map, top_left, fill_value=0.0):
         obs_shape = (self.observation_size, self.observation_size)
@@ -591,45 +871,90 @@ class MAPFEnv(gym.Env):
 
     def _build_blocking_map(self, agent_id, top_left, visible_agents):
         """
-        Build a simplified blocking map for the current agent.
+        Build blocking_map on stopping points:
+            1  -> current side clearly blocked, should not enter
+            0  -> no obvious blocking risk from this side
+           -1  -> far endpoint occupied by other agent (soft caution)
 
-        First version rule:
-            If ANY other agent currently occupies a cell in a corridor,
-            then all endpoints of that corridor are marked as 1 in the blocking map
-            (if those endpoints fall inside the current FOV).
-
-        Note:
-            visible_agents is kept in the signature for compatibility, but this
-            implementation intentionally uses ALL other agents globally, not only
-            visible ones.
+        visible_agents is intentionally not used here; blocking semantics are
+        based on global corridor occupancy and movement trends.
         """
         obs_size = self.observation_size
         blocking_map = np.zeros((obs_size, obs_size), dtype=np.float32)
 
-        if self.corridor_id_map is None:
+        if self.corridor_id_map is None or len(self.stopping_point_meta) == 0:
             return blocking_map
 
-        # 1) Find which corridors are currently occupied by OTHER agents
-        occupied_corridors = set()
-        for other_agent_id in range(1, self.num_agents + 1):
-            if other_agent_id == agent_id:
-                continue
-            x, y = self.world.getPos(other_agent_id)
-            corridor_id = self.corridor_id_map[x, y]
-            if corridor_id != -1:
-                occupied_corridors.add(corridor_id)
+        current_pos = self.world.getPos(agent_id)
+        current_corridor_id = self.corridor_id_map[current_pos[0], current_pos[1]]
 
-        # 2) Mark endpoints of occupied corridors if they fall inside this agent's FOV
         top_x, top_y = top_left
-        for corridor_id in occupied_corridors:
-            endpoints = self.corridor_endpoints.get(corridor_id, [])
-            for ex, ey in endpoints:
-                local_x = ex - top_x
-                local_y = ey - top_y
-                if 0 <= local_x < obs_size and 0 <= local_y < obs_size:
-                    blocking_map[local_x, local_y] = 1.0
+        for stopping_point, meta in self.stopping_point_meta.items():
+            corridor_id = meta["corridor_id"]
+
+            # If the observer is already inside this corridor, this side-entry
+            # signal is not informative for immediate decision making.
+            if current_corridor_id != -1 and corridor_id == current_corridor_id:
+                continue
+
+            blocking_value = self._evaluate_stopping_point_blocking(meta, agent_id)
+            spx, spy = stopping_point
+            local_x = spx - top_x
+            local_y = spy - top_y
+            if 0 <= local_x < obs_size and 0 <= local_y < obs_size:
+                blocking_map[local_x, local_y] = blocking_value
 
         return blocking_map
+
+    def _get_last_distinct_pos(self, other_agent_id, current_pos):
+        last_pos = self.world.getPastPos(other_agent_id)
+        if last_pos == current_pos:
+            return None
+        return last_pos
+
+    def _evaluate_stopping_point_blocking(self, stopping_meta, observer_agent_id):
+        """
+        Evaluate blocking value for one stopping point from observer_agent_id's perspective.
+        """
+        scan_cells = stopping_meta.get("scan_cells", [])
+        is_dead_end = stopping_meta.get("is_dead_end", False)
+
+        for idx, pos in enumerate(scan_cells):
+            state = self.world.state[pos[0], pos[1]]
+            if state <= 0 or state == observer_agent_id:
+                continue
+
+            # Dead-end corridor: any other agent in this corridor blocks entry.
+            if is_dead_end:
+                return 1.0
+
+            # Near-side occupancy blocks immediate entry.
+            if idx == 0:
+                return 1.0
+
+            # Use one-step movement trend to detect whether the other agent is
+            # moving towards this stopping side.
+            last_pos = self._get_last_distinct_pos(state, pos)
+            if last_pos is None:
+                return 1.0
+
+            if idx == len(scan_cells) - 1:
+                if idx > 0 and last_pos != scan_cells[idx - 1]:
+                    return 1.0
+                break
+
+            if last_pos == scan_cells[idx + 1]:
+                return 1.0
+
+        # Dual-end corridor: far endpoint occupied gives soft caution (-1).
+        if not is_dead_end:
+            paired_endpoint = stopping_meta.get("paired_endpoint")
+            if paired_endpoint is not None:
+                endpoint_state = self.world.state[paired_endpoint[0], paired_endpoint[1]]
+                if endpoint_state > 0 and endpoint_state != observer_agent_id:
+                    return -1.0
+
+        return 0.0
 
     # Returns an observation of an agent
     def _observe(self,agent_id):
