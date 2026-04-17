@@ -97,3 +97,12 @@ results/
 model_primal_cpu_smoke/
 train_primal_cpu_smoke/
 gifs_primal_cpu_smoke/
+model_*/
+train_*/
+gifs_*/
+
+*.tfevents.*
+checkpoint
+*.data-00000-of-00001
+*.index
+*.meta
