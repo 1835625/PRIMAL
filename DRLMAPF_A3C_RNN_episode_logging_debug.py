@@ -23,7 +23,7 @@ import tensorflow.contrib.layers as layers
 # import matplotlib.pyplot as plt
 try:
     from od_mstar3 import cpp_mstar
-    USE_CPP_MSTAR = True
+    USE_CPP_MSTAR = False
 except ImportError:
     cpp_mstar = None
     USE_CPP_MSTAR = False
@@ -502,7 +502,7 @@ PRINT_EVERY_EPISODE    = True
 EPISODE_LOG_INTERVAL   = 1
 CHECKPOINT_EVERY       = 100
 NUM_META_AGENTS        = 1
-NUM_THREADS            = 1 #int(multiprocessing.cpu_count() / (2 * NUM_META_AGENTS))
+NUM_THREADS            = 3 #int(multiprocessing.cpu_count() / (2 * NUM_META_AGENTS))
 NUM_BUFFERS            = 1 # NO EXPERIENCE REPLAY int(NUM_THREADS / 2)
 EPISODE_SAMPLES        = EXPERIENCE_BUFFER_SIZE # 64
 LR_Q                   = 2.e-5 #8.e-5 / NUM_THREADS # default: 1e-5
@@ -520,7 +520,7 @@ GLOBAL_NET_SCOPE       = 'global'
 
 #Imitation options
 PRIMING_LENGTH         = 5    # number of episodes at the beginning to train only on demonstrations
-DEMONSTRATION_PROB     = 0.2  # probability of training on a demonstration per episode
+DEMONSTRATION_PROB     = 0.5  # probability of training on a demonstration per episode
 
 # Simulation options
 FULL_HELP              = False
@@ -531,9 +531,9 @@ SAVE_EPISODE_BUFFER    = False
 TRAINING               = True
 GREEDY                 = False
 NUM_EXPS               = 100
-MODEL_NUMBER           = 100
-MAX_EPISODES           = 1000
-DEVICE                 = "/cpu:0"
+MODEL_NUMBER           = 10
+MAX_EPISODES           = 50
+DEVICE                 = "/gpu:0"
 save_lock              = threading.Lock()
 last_saved_ckpt        = 0
 
